@@ -251,8 +251,3 @@ curl -X POST http://localhost:8000/query \
 
 **AI/ML** — Gemini 2.5 Flash (vision + text), Gemini Embedding 001, Faster-Whisper tiny
 
----
-
-## License
-
-MIT
