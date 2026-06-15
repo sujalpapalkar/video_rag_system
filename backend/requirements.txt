@@ -1,0 +1,28 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.12
+aiofiles==24.1.0
+httpx==0.28.0
+pydantic==2.10.3
+
+# Audio
+faster-whisper==1.1.0
+
+# Video / Vision
+opencv-python-headless==4.10.0.84
+easyocr==1.7.2
+ultralytics==8.3.52
+
+# Tracking
+lapx==0.5.10
+
+# RAG / Embeddings
+faiss-cpu==1.9.0.post1
+sentence-transformers==3.3.1
+
+# Utilities
+numpy==1.26.4
+Pillow==11.0.0
+yt-dlp==2024.12.23
+ffmpeg-python==0.2.0google-generativeai
+google-generativeai

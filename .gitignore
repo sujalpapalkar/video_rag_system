@@ -1,0 +1,14 @@
+# Python
+backend/.venv/
+backend/__pycache__/
+backend/uploads/
+backend/*.pyc
+backend/.env
+
+# Node
+frontend/node_modules/
+frontend/.next/
+
+# Misc
+.DS_Store
+*.pt        # model weights (yolo11n.pt is large)
