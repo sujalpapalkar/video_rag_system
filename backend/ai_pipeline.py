@@ -35,9 +35,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 # =====================================================================
 # RESILIENT PRODUCTION MODEL ROUTING
 # =====================================================================
-CHUNK_MODEL = "gemini-2.5-flash-lite"   # Handles rapid parallel frame summaries
-GEMINI_MODEL = "gemini-3.5-flash"      # Handles primary text query reasoning
-EMBEDDING_MODEL = "models/gemini-embedding-001" # Target vector mapping path
+CHUNK_MODEL = "gemini-2.5-flash-lite"       # Handles rapid parallel frame summaries
+GEMINI_MODEL = "gemini-2.5-flash"           # FIX: was "gemini-3.5-flash" (non-existent model)
+EMBEDDING_MODEL = "models/gemini-embedding-001"  # Target vector mapping path
+EMBEDDING_DIM = 768                          # FIX: gemini-embedding-001 produces 768-dim vectors
 
 log.info("Initializing Cloud GenAI client reference...")
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -52,7 +53,7 @@ async def describe_frame_async(image_bytes: bytes) -> str:
         image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
         loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(
-            None, 
+            None,
             lambda: genai_client.models.generate_content(
                 model=CHUNK_MODEL,
                 contents=[image_part, "Describe what is happening in this frame concisely. Focus on people, clothing colors, and text layouts."]
@@ -71,12 +72,13 @@ def process_video_to_local_faiss(sid: str, video_path: str):
     asyncio.run(_async_pipeline_orchestrator(sid, video_path))
 
 
+
 async def _async_pipeline_orchestrator(sid: str, video_path: str):
     SESSION_STORE[sid].update({"status": "processing", "progress": 10, "message": "Analyzing media limits..."})
-    
+
     cmd = [
-        "ffprobe", "-v", "error", 
-        "-show_entries", "format=duration", 
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
         video_path
     ]
@@ -86,7 +88,7 @@ async def _async_pipeline_orchestrator(sid: str, video_path: str):
     except Exception as e:
         log.warning(f"Probe failed, using dynamic safety fallback: {e}")
         duration = 360.0
-        
+
     chunk_size = 15.0
     chunks = []
     current_time = 0.0
@@ -99,29 +101,33 @@ async def _async_pipeline_orchestrator(sid: str, video_path: str):
     log.info(f"[{sid}] Segmented media into {total_chunks} blocks of 15s. Running concurrent processing...")
 
     compiled_scenes = []
-    
+
     SESSION_STORE[sid].update({"progress": 25, "message": "Transcribing audio tracks..."})
     try:
         tmp_audio = f"uploads/{sid}_full.mp3"
-        subprocess.run(["ffmpeg", "-y", "-i", video_path, "-q:a", "0", "-map", "a", tmp_audio, "-loglevel", "quiet"], check=True)
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", video_path, "-q:a", "0", "-map", "a", tmp_audio, "-loglevel", "quiet"],
+            check=True
+        )
         segments, _ = whisper_model.transcribe(tmp_audio, beam_size=1)
         all_segments = list(segments)
-        if os.path.exists(tmp_audio): os.unlink(tmp_audio)
+        if os.path.exists(tmp_audio):
+            os.unlink(tmp_audio)
     except Exception as e:
         log.warning(f"Audio transcription layer error: {e}")
         all_segments = []
 
     SESSION_STORE[sid].update({"progress": 45, "message": "Processing visual snapshots concurrently..."})
-    
+
     frame_tasks = []
     frame_metadata_helpers = []
 
     for idx, (start_sec, end_sec) in enumerate(chunks):
         mid_sec = start_sec + (end_sec - start_sec) / 2
         tmp_frame = f"uploads/{sid}_f_{idx}.jpg"
-        
+
         chunk_transcript = " ".join([
-            seg.text for seg in all_segments 
+            seg.text for seg in all_segments
             if start_sec <= seg.start <= end_sec
         ]).strip()
 
@@ -130,31 +136,33 @@ async def _async_pipeline_orchestrator(sid: str, video_path: str):
                 "ffmpeg", "-y", "-ss", str(mid_sec), "-i", video_path,
                 "-frames:v", "1", "-q:v", "5", "-vf", "scale=320:-2", tmp_frame, "-loglevel", "quiet"
             ], check=True)
-            
+
             if os.path.exists(tmp_frame):
                 with open(tmp_frame, "rb") as f:
                     img_bytes = f.read()
                 os.unlink(tmp_frame)
-                
+
                 frame_tasks.append(describe_frame_async(img_bytes))
                 frame_metadata_helpers.append((start_sec, end_sec, chunk_transcript))
         except Exception as e:
             log.warning(f"Frame generation hitch on block {idx}: {e}")
 
     log.info(f"[{sid}] Launching {len(frame_tasks)} concurrent Gemini vision workers...")
-    
+
     visual_summaries = []
-    batch_size = 5
-    for i in range(0, len(frame_tasks), batch_size):
-        batch = frame_tasks[i:i+batch_size]
+    vision_batch_size = 20
+
+    for i in range(0, len(frame_tasks), vision_batch_size):
+        batch = frame_tasks[i:i + vision_batch_size]
         summaries = await asyncio.gather(*batch)
         visual_summaries.extend(summaries)
-        await asyncio.sleep(1.0)
 
     for idx, visual_desc in enumerate(visual_summaries):
         start_sec, end_sec, transcript = frame_metadata_helpers[idx]
-        combined_text = f"[Audio Transcript]: {transcript or 'Silence.'} [Visual Frame Analysis]: {visual_desc}"
-        
+        combined_text = (
+            f"[Audio Transcript]: {transcript or 'Silence.'} "
+            f"[Visual Frame Analysis]: {visual_desc}"
+        )
         compiled_scenes.append({
             "start_time": start_sec,
             "end_time": end_sec,
@@ -162,26 +170,48 @@ async def _async_pipeline_orchestrator(sid: str, video_path: str):
         })
 
     SESSION_STORE[sid].update({"message": "Building local index vectors...", "progress": 85})
-    
+
     loop = asyncio.get_running_loop()
     embeddings_list = []
-    for item in compiled_scenes:
+    embedding_batch_size = 20
+    # FIX: track actual dimension after first successful batch instead of hardcoding
+    resolved_dim = EMBEDDING_DIM
+
+    for i in range(0, len(compiled_scenes), embedding_batch_size):
+        batch_texts = [
+            item["combined_metadata"]
+            for item in compiled_scenes[i:i + embedding_batch_size]
+        ]
         try:
             emb_res = await loop.run_in_executor(
-                None, 
-                lambda: genai_client.models.embed_content(
+                None,
+                lambda texts=batch_texts: genai_client.models.embed_content(
                     model=EMBEDDING_MODEL,
-                    contents=item["combined_metadata"]
+                    contents=texts
                 )
             )
-            embeddings_list.append(emb_res.embeddings[0].values)
+            batch_embeddings = [emb.values for emb in emb_res.embeddings]
+            # Resolve true dimension from first successful batch
+            if batch_embeddings:
+                resolved_dim = len(batch_embeddings[0])
+            embeddings_list.extend(batch_embeddings)
         except Exception as e:
-            log.error(f"Embedding mapping failure: {e}")
-            embeddings_list.append([0.0] * 3072)
+            log.error(f"Embedding batch failure {i // embedding_batch_size + 1}: {e}")
+            # FIX: use resolved_dim so zero-vectors match actual index dimension
+            embeddings_list.extend([[0.0] * resolved_dim] * len(batch_texts))
+
+    if not embeddings_list:
+        raise RuntimeError("No embeddings generated.")
 
     vector_dimension = len(embeddings_list[0])
-    faiss_index = faiss.IndexFlatL2(vector_dimension)
-    faiss_index.add(np.array(embeddings_list, dtype=np.float32))
+
+    vectors = np.array(embeddings_list, dtype=np.float32)
+
+    # Normalize for cosine similarity via IndexFlatIP
+    faiss.normalize_L2(vectors)
+
+    faiss_index = faiss.IndexFlatIP(vector_dimension)
+    faiss_index.add(vectors)
 
     SESSION_STORE[sid].update({
         "status": "ready",
@@ -189,18 +219,20 @@ async def _async_pipeline_orchestrator(sid: str, video_path: str):
         "message": "Ready",
         "type": "hybrid_faiss_videorag",
         "scenes_data": compiled_scenes,
-        "faiss_index": faiss_index
+        "faiss_index": faiss_index,
+        "vector_dimension": vector_dimension   # Store for query-time embedding
     })
-    
+
     try:
-        if os.path.exists(video_path): os.unlink(video_path)
+        if os.path.exists(video_path):
+            os.unlink(video_path)
     except Exception as e:
-         log.warning(f"Cleanup gap: {e}")
-         
+        log.warning(f"Cleanup gap: {e}")
+
 
 def query_cloud_session(sid: str, question: str) -> dict:
     """
-    Performs similarity search over local FAISS indices and maps Top-K results 
+    Performs similarity search over local FAISS indices and maps Top-K results
     directly into a text context reasoning loop for Gemini.
     Features defensive fallback models to absorb cloud server 503 exceptions.
     """
@@ -209,30 +241,39 @@ def query_cloud_session(sid: str, question: str) -> dict:
         return {"answer": "Error: Active local vector tracker lost.", "timestamps": [], "sources": []}
 
     try:
-        emb_res = genai_client.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=question
-        )
-        query_vector = np.array([emb_res.embeddings[0].values], dtype=np.float32)
+        # FIX: embed the query question before searching FAISS
+        vector_dimension = entry.get("vector_dimension", EMBEDDING_DIM)
+        try:
+            emb_res = genai_client.models.embed_content(
+                model=EMBEDDING_MODEL,
+                contents=[question]
+            )
+            query_vector = np.array([emb_res.embeddings[0].values], dtype=np.float32)
+        except Exception as e:
+            log.error(f"[{sid}] Query embedding failed: {e}")
+            return {"answer": f"Query embedding error: {str(e)}", "timestamps": [], "sources": ["error_handler"]}
+
+        # Normalize query vector to match normalized index (IndexFlatIP == cosine similarity)
+        faiss.normalize_L2(query_vector)
 
         faiss_index = entry["faiss_index"]
-        distances, indices = faiss_index.search(query_vector, k=min(3, len(entry["scenes_data"])))
+        distances, indices = faiss_index.search(query_vector, k=min(5, len(entry["scenes_data"])))
 
         context_blocks = []
         retrieved_timestamps = []
-        
+
         for idx in indices[0]:
-            if idx == -1 or idx >= len(entry["scenes_data"]): 
+            if idx == -1 or idx >= len(entry["scenes_data"]):
                 continue
             matched_scene = entry["scenes_data"][idx]
-            
+
             m_start = matched_scene['start_time']
             m_end = matched_scene['end_time']
             context_blocks.append(
-                f"Video Segment Snapshot [{int(m_start//60)}:{int(m_start%60):02d} - {int(m_end//60)}:{int(m_end%60):02d}]:\n"
+                f"Video Segment Snapshot [{int(m_start // 60)}:{int(m_start % 60):02d} - "
+                f"{int(m_end // 60)}:{int(m_end % 60):02d}]:\n"
                 f"{matched_scene['combined_metadata']}\n"
             )
-            
             retrieved_timestamps.append({
                 "time": int(m_start),
                 "label": "Relevant segment match"
@@ -253,17 +294,20 @@ DETAILED ANCHORED ANSWER (You must cite the exact timecode ranges when providing
 
         # Automated structural failover logic intercepts server constraints transparently
         try:
-            log.info(f"Submitting query inference task straight to {GEMINI_MODEL}...")
+            log.info(f"[{sid}] Submitting query inference task to {GEMINI_MODEL}...")
             response = genai_client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=prompt
             )
         except Exception as server_error:
-            # Fall back immediately if the premium flagship engine reports a load bottleneck (503)
+            # Fall back immediately if the primary engine reports a load bottleneck (503)
             if "503" in str(server_error) or "UNAVAILABLE" in str(server_error).upper():
-                log.warning(f"Primary cluster node {GEMINI_MODEL} reporting heavy load (503). Running failover routine...")
+                log.warning(
+                    f"[{sid}] Primary cluster node {GEMINI_MODEL} reporting heavy load (503). "
+                    f"Running failover routine..."
+                )
                 response = genai_client.models.generate_content(
-                    model=CHUNK_MODEL,  # Invokes the highly responsive gemini-2.5-flash-lite endpoint
+                    model=CHUNK_MODEL,
                     contents=prompt
                 )
             else:
@@ -274,6 +318,7 @@ DETAILED ANCHORED ANSWER (You must cite the exact timecode ranges when providing
             "timestamps": retrieved_timestamps[:5],
             "sources": ["local_faiss_index"]
         }
+
     except Exception as e:
         log.error(f"[{sid}] Critical vector retrieval query crash: {e}", exc_info=True)
         return {"answer": f"Retrieval Error Context: {str(e)}", "timestamps": [], "sources": ["error_handler"]}
